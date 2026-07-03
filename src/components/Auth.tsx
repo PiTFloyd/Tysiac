@@ -30,7 +30,16 @@ export default function Auth({ onAuthSuccess }: AuthProps) {
         body: JSON.stringify({ username, password }),
       });
 
-      const data = await res.json();
+      const contentType = res.headers.get("content-type");
+      let data: any = {};
+      
+      if (contentType && contentType.includes("application/json")) {
+        data = await res.json();
+      } else {
+        const text = await res.text();
+        const shortText = text.length > 100 ? text.substring(0, 100) + "..." : text;
+        throw new Error(`Błąd serwera (Status: ${res.status}): ${shortText || "Pusta odpowiedź"}`);
+      }
 
       if (!res.ok) {
         throw new Error(data.error || "Coś poszło nie tak. Spróbuj ponownie.");
