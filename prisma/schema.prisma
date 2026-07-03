@@ -1,0 +1,38 @@
+// prisma/schema.prisma
+
+datasource db {
+  provider = "sqlite"
+  url      = "file:./dev.db"
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+model User {
+  id           String         @id @default(uuid())
+  username     String         @unique
+  passwordHash String
+  createdAt    DateTime       @default(now())
+  updatedAt    DateTime       @updatedAt
+  matchesWon   MatchHistory[] @relation("WinnerMatches")
+}
+
+model MatchHistory {
+  id        String   @id @default(uuid())
+  status    String   // "COMPLETED" or "ABANDONED"
+  scores    String   // JSON stringified player scores list: [{username, score}]
+  winnerId  String?
+  winner    User?    @relation("WinnerMatches", fields: [winnerId], references: [id])
+  createdAt DateTime @default(now())
+}
+
+model SavedGame {
+  id        String   @id @default(uuid())
+  mode      String   // "solo" | "duo" | "multi"
+  status    String   // e.g. "BIDDING", "SKAT_REVEAL", "PLAYING", "DISTRIBUTING"
+  players   String   // JSON array of players who played: [{id, username, isBot, ready}]
+  gameState String   // JSON string of the complete GameState
+  createdAt DateTime @default(now())
+}
+

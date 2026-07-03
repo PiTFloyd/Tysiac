@@ -1,0 +1,6 @@
+{
+  "name": "Thousand Card Game",
+  "description": "Wciągająca tradycyjna polska gra karciana Tysiąc z lobby, inteligentnymi botami i rozgrywką online w czasie rzeczywistym.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
