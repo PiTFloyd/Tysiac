@@ -378,7 +378,7 @@ export function registerSocketHandlers(io: Server) {
     // 3. Player ready
     socket.on("room:ready", ({ roomId }: { roomId: string }) => {
       const room = rooms[roomId?.toUpperCase()];
-      if (!room) return;
+      if (!room || room.status !== "LOBBY") return;
 
       const player = room.players.find((p) => p.username === username);
       if (player) {
@@ -397,7 +397,7 @@ export function registerSocketHandlers(io: Server) {
     // 3.5. Owner start game (forces game start, fills empty spots with bots)
     socket.on("room:start", ({ roomId }: { roomId: string }) => {
       const room = rooms[roomId?.toUpperCase()];
-      if (!room) return;
+      if (!room || room.status !== "LOBBY") return;
 
       const isOwner = room.players[0]?.username === username;
       if (!isOwner) {
@@ -774,11 +774,11 @@ export function registerSocketHandlers(io: Server) {
       // Marriage can only be declared if:
       // 1. It is the lead play of a trick (currentTrick.length === 0)
       // 2. The player has both King (K) and Queen (Q) of the same suit in their hand
-      // 3. Either the King or Queen is played, and player declares it
+      // 3. Either the King or Queen is played. We automatically declare the marriage if they lead the trick and have both partner cards!
       let marriageDeclared = false;
       let marriageSuit: Card["suit"] | null = null;
 
-      if (declareMarriage && gs.currentTrick.length === 0) {
+      if (gs.currentTrick.length === 0) {
         if (card.value === "K" || card.value === "Q") {
           const partnerValue = card.value === "K" ? "Q" : "K";
           const hasPartner = hand.some((c) => c.suit === card.suit && c.value === partnerValue);
@@ -800,7 +800,7 @@ export function registerSocketHandlers(io: Server) {
         gs.trump = marriageSuit;
         const pts = MARRIAGE_VALUES[marriageSuit];
         gs.roundMarriages[playerUsername].push(marriageSuit);
-        gs.roundScores[playerUsername] += pts;
+        gs.roundScores[playerUsername] = (gs.roundScores[playerUsername] || 0) + pts;
 
         let suitName = "";
         if (marriageSuit === "H") suitName = "Kier (Czerwień ♥)";
@@ -877,7 +877,7 @@ export function registerSocketHandlers(io: Server) {
       const winner = winningPlay.username;
       const trickPoints = gs.currentTrick.reduce((acc, curr) => acc + curr.card.points, 0);
 
-      gs.roundScores[winner] += trickPoints;
+      gs.roundScores[winner] = (gs.roundScores[winner] || 0) + trickPoints;
       gs.tricksCount += 1;
 
       logToRoom(room.id, `♠ Lewę wygrywa ${winner} i zdobywa +${trickPoints} pkt za karty.`);
@@ -908,6 +908,9 @@ export function registerSocketHandlers(io: Server) {
       logToRoom(room.id, `💣 ${bidderName} zdetonował Bombę! Przeciwnicy otrzymują po +60 pkt do tabeli, a ${bidderName} 0 pkt. Przejście do następnej rundy.`);
 
       room.players.forEach((p) => {
+        if (gs.scores[p.username] === undefined) {
+          gs.scores[p.username] = 0;
+        }
         if (p.username !== bidderName) {
           gs.scores[p.username] += 60;
         }
@@ -974,6 +977,9 @@ export function registerSocketHandlers(io: Server) {
       // Final round score calculations
       room.players.forEach((p) => {
         const name = p.username;
+        if (gs.scores[name] === undefined) gs.scores[name] = 0;
+        if (gs.roundScores[name] === undefined) gs.roundScores[name] = 0;
+
         const scoreEarned = gs.roundScores[name];
         let finalEarned = roundScore(scoreEarned); // Standard 10-point rounding
 
@@ -1074,54 +1080,91 @@ export function registerSocketHandlers(io: Server) {
       if (!room.gameState) return;
       const gs = room.gameState;
 
-      // Helper function to estimate hand strength in points
+      // Helper function to estimate hand strength in points (takes initial 7 cards or 10 cards)
       function estimateHandStrength(hand: Card[]): number {
         const suits: Card["suit"][] = ["H", "D", "C", "S"];
         let marriagePoints = 0;
-        let bestMarriageSuit: Card["suit"] | null = null;
-        let bestMarriageVal = 0;
+        const marriages: Card["suit"][] = [];
+        
         for (const suit of suits) {
           const hasK = hand.some((c) => c.suit === suit && c.value === "K");
           const hasQ = hand.some((c) => c.suit === suit && c.value === "Q");
           if (hasK && hasQ) {
             marriagePoints += MARRIAGE_VALUES[suit];
-            if (MARRIAGE_VALUES[suit] > bestMarriageVal) {
-              bestMarriageVal = MARRIAGE_VALUES[suit];
-              bestMarriageSuit = suit;
+            marriages.push(suit);
+          }
+        }
+
+        // Find our primary trump suit (highest value marriage)
+        let primaryTrump: Card["suit"] | null = null;
+        if (marriages.length > 0) {
+          marriages.sort((a, b) => MARRIAGE_VALUES[b] - MARRIAGE_VALUES[a]);
+          primaryTrump = marriages[0];
+        }
+
+        // Count suit distributions to find voids (only counting non-trump suits)
+        const suitCounts: Record<Card["suit"], number> = {
+          H: hand.filter((c) => c.suit === "H").length,
+          D: hand.filter((c) => c.suit === "D").length,
+          C: hand.filter((c) => c.suit === "C").length,
+          S: hand.filter((c) => c.suit === "S").length,
+        };
+
+        let trickPoints = 0;
+        const trumpsCount = primaryTrump ? suitCounts[primaryTrump] : 0;
+
+        for (const suit of suits) {
+          const isTrump = suit === primaryTrump;
+          const suitCards = hand.filter((c) => c.suit === suit);
+
+          // Calculate value of each card in this suit
+          for (const c of suitCards) {
+            if (c.value === "A") {
+              trickPoints += isTrump ? 18 : 15; // Ace of trumps is even more valuable
+            } else if (c.value === "10") {
+              const hasAce = suitCards.some((x) => x.value === "A");
+              if (hasAce) {
+                trickPoints += isTrump ? 15 : 12; // Ten backed by Ace
+              } else {
+                trickPoints += isTrump ? 10 : 6;  // Ten without Ace
+              }
+            } else {
+              // Lower cards: King, Queen, Jack, Nine
+              if (isTrump) {
+                // Trump lower cards are very useful for winning tricks or trumping
+                if (c.value === "K") trickPoints += 9;
+                else if (c.value === "Q") trickPoints += 8;
+                else if (c.value === "J") trickPoints += 6;
+                else if (c.value === "9") trickPoints += 4;
+              } else {
+                // Non-trump lower cards have almost zero value for winning tricks, but let's give a tiny score
+                if (c.value === "K") trickPoints += 2;
+                else if (c.value === "Q") trickPoints += 1;
+              }
             }
           }
-        }
 
-        let cardPointsEst = 0;
-        for (const c of hand) {
-          if (c.value === "A") cardPointsEst += 11;
-          else if (c.value === "10") cardPointsEst += 10;
-          else if (c.value === "K") cardPointsEst += 4;
-          else if (c.value === "Q") cardPointsEst += 3;
-          else if (c.value === "J") cardPointsEst += 2;
-        }
-
-        let expectedTrickWinPoints = 0;
-        const aces = hand.filter((c) => c.value === "A");
-        const tens = hand.filter((c) => c.value === "10");
-
-        expectedTrickWinPoints += aces.length * 15;
-        for (const t of tens) {
-          const hasSameAce = hand.some((c) => c.suit === t.suit && c.value === "A");
-          if (hasSameAce) {
-            expectedTrickWinPoints += 12;
-          } else {
-            expectedTrickWinPoints += 5;
+          // Void bonus: if we have a void in a non-trump suit, and we have trumps
+          if (!isTrump && primaryTrump && suitCounts[suit] === 0 && trumpsCount > 0) {
+            trickPoints += 15; // Void lets us win a trick by trumping
           }
         }
 
-        if (bestMarriageSuit) {
-          const trumpCards = hand.filter((c) => c.suit === bestMarriageSuit);
-          expectedTrickWinPoints += trumpCards.length * 8;
+        // If we have multiple marriages, we can declare the second one!
+        if (marriages.length >= 2) {
+          trickPoints += 20; // Multi-marriage bonus
         }
 
-        const maxEstimatedCardPoints = Math.min(120, cardPointsEst + expectedTrickWinPoints);
-        return marriagePoints + maxEstimatedCardPoints;
+        // Add a "musik bonus" if we are bidding (7 cards in hand)
+        if (hand.length === 7) {
+          // If no marriages, musik is less helpful for bidding high, as we still can't declare anything.
+          trickPoints += marriages.length > 0 ? 15 : 5;
+        }
+
+        // Cap trick points at 120 (total card points in the game)
+        const estimatedTricksValue = Math.min(120, trickPoints);
+
+        return marriagePoints + estimatedTricksValue;
       }
 
       // 1. Bidding Phase
@@ -1129,28 +1172,24 @@ export function registerSocketHandlers(io: Server) {
         const bidding = gs.bidding;
         const hand = gs.hands[bot.username] || [];
 
-        // Dynamic and smarter bidding based on estimated strength of initial 7 cards
+        // Calculate marriages
         const suitsWithMarriages = (["H", "D", "C", "S"] as Card["suit"][]).filter((suit) => {
           const hasK = hand.some((c) => c.suit === suit && c.value === "K");
           const hasQ = hand.some((c) => c.suit === suit && c.value === "Q");
           return hasK && hasQ;
         });
 
-        // Safe bidding limit:
-        let maxSafeBid = 100;
-        if (suitsWithMarriages.length > 0) {
-          // Marriage points + expected points
-          maxSafeBid = 100 + suitsWithMarriages.reduce((sum, s) => sum + MARRIAGE_VALUES[s], 0);
-          const aceCount = hand.filter(c => c.value === "A").length;
-          maxSafeBid += aceCount * 10;
-        } else {
-          // No marriages: can bid 100 or 110 if we have enough Aces, otherwise pass
-          const acesCount = hand.filter((c) => c.value === "A").length;
-          maxSafeBid = acesCount >= 3 ? 110 : acesCount >= 2 ? 100 : 90;
-        }
+        const hasMarriages = suitsWithMarriages.length > 0;
+        let maxSafeBid = Math.floor(estimateHandStrength(hand) / 10) * 10;
 
-        // Cap at 300, or 110 if no marriages
-        maxSafeBid = Math.min(suitsWithMarriages.length > 0 ? 300 : 110, maxSafeBid);
+        // Cap at 300, or 100/110 if no marriages (very risky to go higher without a marriage!)
+        if (!hasMarriages) {
+          // If we have at least 3 Aces, we can try bidding up to 100 (which is music mandatory)
+          const acesCount = hand.filter((c) => c.value === "A").length;
+          maxSafeBid = Math.min(acesCount >= 3 ? 100 : 90, maxSafeBid);
+        } else {
+          maxSafeBid = Math.min(300, maxSafeBid);
+        }
 
         if (bidding.minBid <= maxSafeBid) {
           handleBidAction(room, bot.username, bidding.minBid, false);
@@ -1168,14 +1207,15 @@ export function registerSocketHandlers(io: Server) {
         const estimated = estimateHandStrength(hand);
 
         // A. Bomba Option: surrender if hand is terrible after taking skat
-        if (estimated < currentBid - 15 && currentBid >= 100 && !(gs.hasUsedBomb && gs.hasUsedBomb[bot.username])) {
+        // We only use Bomba if we bid at least 110, have a large deficit (at least 20 points), and haven't used the bomb yet
+        if (currentBid >= 110 && estimated < currentBid - 20 && !(gs.hasUsedBomb && gs.hasUsedBomb[bot.username])) {
           logToRoom(room.id, `🤖 Bot ${bot.username} analizuje swoje 10 kart... szacowana siła: ${estimated} pkt przy kontrakcie ${currentBid}. Decyzja: BOMBA!`);
           handleBomba(room, bot.username);
           emitRoomState(room);
           return;
         }
 
-        // C. Calculate marriages first to apply the 140 points limit rule if no marriages are present
+        // B. Calculate marriages first to apply the 120 points limit rule if no marriages are present
         const suits: Card["suit"][] = ["H", "D", "C", "S"];
         const marriageSuits = suits.filter((suit) => {
           const hasK = hand.some((c) => c.suit === suit && c.value === "K");
@@ -1185,7 +1225,7 @@ export function registerSocketHandlers(io: Server) {
 
         // B. Increase Bid Option: raise contract if hand is exceptionally strong
         const hasMarriages = marriageSuits.length > 0;
-        const maxAllowedBid = hasMarriages ? 300 : 140;
+        const maxAllowedBid = hasMarriages ? 300 : 120;
         const potentialMaxBid = Math.min(maxAllowedBid, Math.floor(estimated / 10) * 10);
         if (potentialMaxBid > currentBid && potentialMaxBid >= currentBid + 10) {
           gs.bidding.highestBid = potentialMaxBid;
@@ -1193,21 +1233,59 @@ export function registerSocketHandlers(io: Server) {
           emitRoomState(room);
         }
 
-        // C. Distribute cards (distribute worst 2 cards, keeping marriages/Aces intact)
+        // C. Distribute cards (distribute worst 2 cards, keeping marriages/Aces intact, and try to create voids)
+        const suitCounts: Record<Card["suit"], number> = {
+          H: hand.filter((c) => c.suit === "H").length,
+          D: hand.filter((c) => c.suit === "D").length,
+          C: hand.filter((c) => c.suit === "C").length,
+          S: hand.filter((c) => c.suit === "S").length,
+        };
 
         function getCardBadness(card: Card): number {
-          if (card.value === "A") return 0;
-          if (card.value === "10") return 1;
-
           const isPartOfMarriage = marriageSuits.includes(card.suit) && (card.value === "K" || card.value === "Q");
-          if (isPartOfMarriage) return 2;
+          
+          // 1. NEVER distribute cards that are part of a marriage
+          if (isPartOfMarriage) return 1;
 
-          if (card.value === "K") return 5;
-          if (card.value === "Q") return 6;
-          if (card.value === "J") return 8;
-          if (card.value === "9") return 10; // 9s are worst
+          // 2. NEVER distribute Aces
+          if (card.value === "A") return 2;
 
-          return 7;
+          // 3. Keep Tens if possible
+          if (card.value === "10") {
+            const hasAce = hand.some((c) => c.suit === card.suit && c.value === "A");
+            return hasAce ? 3 : 4;
+          }
+
+          // 4. Primary marriage (our trump suit) is highly valuable. Keep trumps!
+          const primaryTrumpSuit = marriageSuits.length > 0 
+            ? [...marriageSuits].sort((a, b) => MARRIAGE_VALUES[b] - MARRIAGE_VALUES[a])[0] 
+            : null;
+
+          if (primaryTrumpSuit && card.suit === primaryTrumpSuit) {
+            if (card.value === "K" || card.value === "Q") return 5;
+            return 6; // J/9 of trump
+          }
+
+          // 5. Creating a VOID: If a suit has 1 or 2 cards, and we have a trump suit active,
+          // discarding these card(s) can create a void, which is highly advantageous!
+          const count = suitCounts[card.suit];
+          let voidBonus = 0;
+          if (marriageSuits.length > 0) { // Void is only useful if we have trumps to cut with!
+            if (count === 1) {
+              voidBonus = 40; // High bonus to discard lone card to create void
+            } else if (count === 2) {
+              voidBonus = 20; // Medium bonus to discard one of 2 cards
+            }
+          }
+
+          // 6. Values based on card rank (Aces and Tens already handled above)
+          let rankScore = 0;
+          if (card.value === "9") rankScore = 50;      // 9 is worst
+          else if (card.value === "J") rankScore = 40; // J is bad
+          else if (card.value === "Q") rankScore = 20; // Q without partner
+          else if (card.value === "K") rankScore = 15; // K without partner
+
+          return rankScore + voidBonus;
         }
 
         const sortedByBadness = [...hand].sort((a, b) => getCardBadness(b) - getCardBadness(a));
@@ -1238,6 +1316,31 @@ export function registerSocketHandlers(io: Server) {
           return hasK && hasQ && (c.value === "K" || c.value === "Q");
         };
 
+        // Helper to check if any opponent has a higher card of the same suit in their hand, or can trump us
+        const isHighestRemainingInSuit = (card: Card): boolean => {
+          const valueRank = RANK_ORDER[card.value];
+          // Check if any opponent holds a higher card of this suit
+          const opponentHoldsHigher = Object.entries(gs.hands).some(([username, opponentHand]) => {
+            if (username === bot.username) return false;
+            return opponentHand.some((c) => c.suit === card.suit && RANK_ORDER[c.value] > valueRank);
+          });
+          if (opponentHoldsHigher) return false;
+
+          // If trump is active, and we are not playing a trump card
+          if (gs.trump && card.suit !== gs.trump) {
+            // Check if any opponent is void in this suit AND holds at least one trump
+            const opponentCanTrump = Object.entries(gs.hands).some(([username, opponentHand]) => {
+              if (username === bot.username) return false;
+              const hasSuit = opponentHand.some((c) => c.suit === card.suit);
+              const hasTrump = opponentHand.some((c) => c.suit === gs.trump);
+              return !hasSuit && hasTrump;
+            });
+            if (opponentCanTrump) return false;
+          }
+
+          return true;
+        };
+
         // If leading the trick
         if (gs.currentTrick.length === 0) {
           // Play marriage meldunek first if available
@@ -1251,10 +1354,10 @@ export function registerSocketHandlers(io: Server) {
             meldableSuits.sort((a, b) => MARRIAGE_VALUES[b] - MARRIAGE_VALUES[a]);
             const targetSuit = meldableSuits[0];
 
-            // Smart check: Do we have the Ace of this suit?
+            // If we have the Ace of this marriage suit, cash the Ace first to guarantee winning this trick,
+            // then we can declare marriage on the next turn!
             const hasAceOfSuit = hand.some((c) => c.suit === targetSuit && c.value === "A");
             if (hasAceOfSuit) {
-              // Cash the Ace first to guarantee winning this trick, then we can declare marriage on the next turn!
               selectedCard = hand.find((c) => c.suit === targetSuit && c.value === "A") || null;
             } else {
               // Play the Queen to declare the marriage
@@ -1270,42 +1373,46 @@ export function registerSocketHandlers(io: Server) {
           if (!selectedCard && gs.bidding.highestBidder === bot.username && gs.trump) {
             const trumpsInHand = hand.filter((c) => c.suit === gs.trump);
             // If we have high trumps, lead one to clear opponents' trumps
-            const highTrumps = trumpsInHand.filter((c) => c.value === "A" || c.value === "10");
+            const highTrumps = trumpsInHand.filter((c) => c.value === "A" || c.value === "10" || c.value === "K");
             if (highTrumps.length > 0) {
+              // Lead our highest trump to pull theirs
+              highTrumps.sort((a, b) => RANK_ORDER[b.value] - RANK_ORDER[a.value]);
               selectedCard = highTrumps[0];
-            } else if (trumpsInHand.length > 0 && gs.tricksCount < 4) {
-              // Lead any trump early in the round
+            } else if (trumpsInHand.length > 0 && gs.tricksCount < 5) {
+              // Lead any trump early in the round to exhaust opponents
               selectedCard = trumpsInHand[0];
             }
           }
 
-          // If still no card selected, cash Aces
+          // If no marriage/trump pulling, cash any cards that are guaranteed to win because no opponent holds a higher card
           if (!selectedCard) {
-            const aces = hand.filter((c) => c.value === "A");
-            if (aces.length > 0) {
-              selectedCard = aces[0];
+            const guaranteedWinners = hand.filter((c) => isHighestRemainingInSuit(c));
+            if (guaranteedWinners.length > 0) {
+              // Play the one with the highest rank/points (e.g. Ace, then 10, then King)
+              guaranteedWinners.sort((a, b) => RANK_ORDER[b.value] - RANK_ORDER[a.value]);
+              selectedCard = guaranteedWinners[0];
             }
           }
 
-          // If still no card selected, cash Tens if we also hold the Ace of that same suit
-          if (!selectedCard) {
-            const tens = hand.filter((c) => c.value === "10");
-            for (const t of tens) {
-              if (hand.some((c) => c.suit === t.suit && c.value === "A")) {
-                selectedCard = t;
-                break;
-              }
-            }
-          }
-
-          // Fallback: play lowest point card that is NOT part of a marriage we want to declare
+          // Fallback: play lowest point card that is NOT part of a marriage we want to declare,
+          // and prefer leading low cards (9, J) rather than 10s or Kings without protection.
           if (!selectedCard) {
             const nonMarriageCards = hand.filter((c) => !isCardInMarriage(c));
             const candidates = nonMarriageCards.length > 0 ? nonMarriageCards : hand;
-            selectedCard = candidates.reduce((prev, curr) => (curr.points < prev.points ? curr : prev));
+            
+            // Sort candidates to find the safest card to lead (lowest points first, e.g., 9, J, Q, K, 10, A)
+            // We want to avoid leading high points if we aren't guaranteed to win!
+            candidates.sort((a, b) => {
+              // Aces and Tens are precious, keep them if possible
+              const aVal = a.value === "A" || a.value === "10" ? 100 + a.points : a.points;
+              const bVal = b.value === "A" || b.value === "10" ? 100 + b.points : b.points;
+              return aVal - bVal;
+            });
+            
+            selectedCard = candidates[0];
           }
         } else {
-          // Not leading, follow rules using the new validator
+          // Not leading, follow rules using the validator
           const allowedCards = getValidCardsToPlay(hand, gs.currentTrick, gs.trump);
 
           // Find current winning play to see what beats it
@@ -1331,7 +1438,12 @@ export function registerSocketHandlers(io: Server) {
           };
           const isPartnerWinning = arePlayersPartners(bot.username, winningPlay.username);
 
-          // Let's find which of our allowed cards beat the winning play
+          // We should only grease our partner if it is SAFE (i.e. the bidder has already played in this trick, OR we are the last player)
+          const bidder = gs.bidding.highestBidder;
+          const bidderHasPlayed = gs.currentTrick.some((play) => play.username === bidder);
+          const isSafeToGrease = isPartnerWinning && (gs.currentTrick.length === 2 || bidderHasPlayed);
+
+          // Find which of our allowed cards beat the winning play
           const beatingAllowedCards = allowedCards.filter((c) => {
             const isWinnerTrump = winningPlay.card.suit === gs.trump;
             const isCardTrump = c.suit === gs.trump;
@@ -1344,14 +1456,16 @@ export function registerSocketHandlers(io: Server) {
             return false;
           });
 
-          if (isPartnerWinning) {
-            // Partner is winning! Let's grease (smarować) them with our highest point card
-            // But let's avoid throwing marriage cards if we can
-            const nonMarriageAllowed = allowedCards.filter((c) => !isCardInMarriage(c));
-            const candidates = nonMarriageAllowed.length > 0 ? nonMarriageAllowed : allowedCards;
+          if (isSafeToGrease) {
+            // Partner is winning and it's safe! Let's grease (smarować) them with our highest point card
+            // Avoid throwing marriage cards and Aces if possible
+            const safeGreaseCandidates = allowedCards.filter((c) => !isCardInMarriage(c) && c.value !== "A");
+            const candidates = safeGreaseCandidates.length > 0 ? safeGreaseCandidates : allowedCards;
+            
+            // Play highest point card
             selectedCard = candidates.reduce((prev, curr) => (curr.points > prev.points ? curr : prev));
           } else {
-            // Partner is NOT winning (either bidder is winning, or we are the bidder and a defender is winning)
+            // Either partner is not winning, or it's not safe to grease (bidder still to play)
             if (beatingAllowedCards.length > 0) {
               // We can beat it, let's play the lowest rank card that beats it (efficient win)
               selectedCard = beatingAllowedCards.reduce((prev, curr) => (RANK_ORDER[curr.value] < RANK_ORDER[prev.value] ? curr : prev));
@@ -1479,16 +1593,42 @@ export function registerSocketHandlers(io: Server) {
         logToRoom(room.id, `💾 Wszyscy gracze zagłosowali za zapisaniem gry! Gra jest zapisywana w bazie danych...`);
         
         try {
-          const savedGame = await prisma.savedGame.create({
-            data: {
-              mode: room.mode,
-              status: room.status,
-              players: JSON.stringify(room.players),
-              gameState: JSON.stringify(room.gameState),
+          let savedGame;
+          if (room.restoredFromSavedGameId) {
+            try {
+              savedGame = await prisma.savedGame.update({
+                where: { id: room.restoredFromSavedGameId },
+                data: {
+                  mode: room.mode,
+                  status: room.status,
+                  players: JSON.stringify(room.players),
+                  gameState: JSON.stringify(room.gameState),
+                }
+              });
+              logToRoom(room.id, `✅ Stan zapisu gry zaktualizowany pomyślnie!`);
+            } catch (updateErr) {
+              console.warn("Failed to update existing saved game, creating new one:", updateErr);
+              savedGame = await prisma.savedGame.create({
+                data: {
+                  mode: room.mode,
+                  status: room.status,
+                  players: JSON.stringify(room.players),
+                  gameState: JSON.stringify(room.gameState),
+                }
+              });
+              logToRoom(room.id, `✅ Gra pomyślnie zapisana!`);
             }
-          });
-          
-          logToRoom(room.id, `✅ Gra pomyślnie zapisana!`);
+          } else {
+            savedGame = await prisma.savedGame.create({
+              data: {
+                mode: room.mode,
+                status: room.status,
+                players: JSON.stringify(room.players),
+                gameState: JSON.stringify(room.gameState),
+              }
+            });
+            logToRoom(room.id, `✅ Gra pomyślnie zapisana!`);
+          }
           
           // Interrupt game
           room.status = "FINISHED";
@@ -1622,6 +1762,38 @@ export function registerSocketHandlers(io: Server) {
             restoredFromSavedGameId: savedGameId,
             saveVotes: {}
           };
+
+          // Defensive normalization of loaded game state
+          if (restoredRoom.gameState) {
+            const gs = restoredRoom.gameState;
+            if (!gs.scores) gs.scores = {};
+            if (!gs.roundScores) gs.roundScores = {};
+            if (!gs.roundMarriages) gs.roundMarriages = {};
+            if (!gs.hands) gs.hands = {};
+            if (!gs.hasUsedBomb) gs.hasUsedBomb = {};
+
+            restoredPlayers.forEach((p: any) => {
+              if (gs.scores[p.username] === undefined) {
+                gs.scores[p.username] = 0;
+              } else {
+                gs.scores[p.username] = Number(gs.scores[p.username]) || 0;
+              }
+              if (gs.roundScores[p.username] === undefined) {
+                gs.roundScores[p.username] = 0;
+              } else {
+                gs.roundScores[p.username] = Number(gs.roundScores[p.username]) || 0;
+              }
+              if (gs.roundMarriages[p.username] === undefined) {
+                gs.roundMarriages[p.username] = [];
+              }
+              if (gs.hands[p.username] === undefined) {
+                gs.hands[p.username] = [];
+              }
+              if (gs.hasUsedBomb[p.username] === undefined) {
+                gs.hasUsedBomb[p.username] = false;
+              }
+            });
+          }
           
           // Initialize saveVotes such that bots have true, and humans have false
           restoredRoom.players.forEach((p) => {
@@ -1714,6 +1886,13 @@ export function registerSocketHandlers(io: Server) {
             room.status = "FINISHED";
             room.winnerUsername = room.players.find((p) => p.username !== username && !p.isBot)?.username || "Brak";
             logToRoom(room.id, `Gra przerwana z powodu rezygnacji/rozłączenia ${username}.`);
+
+            // Clean up the saved game if this room was restored from one
+            if (room.restoredFromSavedGameId) {
+              prisma.savedGame.delete({
+                where: { id: room.restoredFromSavedGameId }
+              }).catch(e => console.error("Error deleting saved game on resignation/leave:", e));
+            }
           }
           // Remove the player so they don't receive future state updates of this room
           room.players.splice(playerIdx, 1);

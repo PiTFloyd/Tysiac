@@ -1,6 +1,7 @@
 // src/db.ts
 
 import { PrismaClient } from "@prisma/client";
+import { execSync } from "child_process";
 
 // Prevent multiple instances of Prisma Client in development/HMR
 declare global {
@@ -16,11 +17,21 @@ if (process.env.NODE_ENV !== "production") {
 }
 
 /**
- * Checks the database connection gracefully.
+ * Checks the database connection gracefully and ensures migrations are pushed.
  * This allows the application to start even if the database is not yet fully configured/migrated.
  */
 export async function checkDatabaseConnection(): Promise<boolean> {
   try {
+    // Automatically push/ensure database schema is up-to-date
+    console.log("=========================================");
+    console.log("Synchronizing SQLite database schema...");
+    try {
+      execSync("npx prisma db push --accept-data-loss", { stdio: "inherit" });
+      console.log("✅ SQLite database schema synchronized successfully.");
+    } catch (pushErr) {
+      console.error("⚠️ Warning: Prisma db push failed, trying to continue anyway:", pushErr);
+    }
+
     // Enable WAL mode and busy timeout for SQLite stability and crash/corruption prevention
     try {
       await prisma.$queryRawUnsafe(`PRAGMA journal_mode=WAL;`);
@@ -44,3 +55,4 @@ export async function checkDatabaseConnection(): Promise<boolean> {
     return false;
   }
 }
+

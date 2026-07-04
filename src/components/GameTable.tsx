@@ -135,6 +135,13 @@ export default function GameTable({ socket, roomId, user, onBackToLobby }: GameT
   const gameState = room?.gameState;
   const isMyTurn = gameState?.currentTurn === user.username;
 
+  // Clear any stale long-press/touch flags when our turn changes or the trick advances
+  useEffect(() => {
+    isLongPressRef.current = {};
+    Object.values(touchTimerRef.current).forEach((t: any) => clearTimeout(t));
+    touchTimerRef.current = {};
+  }, [isMyTurn, gameState?.currentTrick?.length]);
+
   // Find left and right opponents relative to current user
   const myIndex = room ? room.players.findIndex((p) => p.username === user.username) : -1;
   const leftOpponent = room && myIndex !== -1 ? room.players[(myIndex + 1) % 3] : null;

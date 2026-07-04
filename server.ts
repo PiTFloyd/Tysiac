@@ -15,8 +15,8 @@ async function startServer() {
   const app = express();
   const PORT = 3000;
 
-  // Gracefully and asynchronously check database connection
-  checkDatabaseConnection();
+  // Gracefully check database connection and sync schema before starting
+  await checkDatabaseConnection();
 
   // Basic security with helmet, disabling CSP to avoid blocking development assets and Socket.io connections
   app.use(
