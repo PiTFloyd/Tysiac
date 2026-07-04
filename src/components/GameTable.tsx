@@ -775,6 +775,7 @@ export default function GameTable({ socket, roomId, user, onBackToLobby }: GameT
               {gameState?.hand && gameState.hand.length > 0 ? (
                 gameState.hand.map((c) => {
                   const isSelected = selectedCardId === c.id;
+                  const isValid = gameState?.validCardIds ? gameState.validCardIds.includes(c.id) : true;
                   return (
                     <PlayingCardButton
                       key={c.id}
@@ -790,6 +791,7 @@ export default function GameTable({ socket, roomId, user, onBackToLobby }: GameT
                       setSelectedCardId={setSelectedCardId}
                       handlePlayCard={handlePlayCard}
                       isLongPressRef={isLongPressRef}
+                      isValid={isValid}
                     />
                   );
                 })
@@ -867,6 +869,7 @@ interface PlayingCardButtonProps {
   setSelectedCardId: (id: string | null) => void;
   handlePlayCard: (id: string, declareMeld: boolean) => void;
   isLongPressRef: React.RefObject<Record<string, boolean>>;
+  isValid?: boolean;
 }
 
 // Memoized Card Component for zero-overhead hand updates
@@ -883,6 +886,7 @@ const PlayingCardButton = React.memo(function PlayingCardButton({
   setSelectedCardId,
   handlePlayCard,
   isLongPressRef,
+  isValid = true,
 }: PlayingCardButtonProps) {
   const suitInfo = getCardSuitDetails(card.suit);
 
@@ -893,14 +897,31 @@ const PlayingCardButton = React.memo(function PlayingCardButton({
     }
     if (roomStatus === "DISTRIBUTING" && skatWinner === username) {
       setSelectedCardId(card.id);
-    } else if (roomStatus === "PLAYING" && isMyTurn) {
+    } else if (roomStatus === "PLAYING" && isMyTurn && isValid) {
       handlePlayCard(card.id, e.shiftKey || isShiftPressed);
     }
   };
 
   const isDisabled =
-    (roomStatus === "PLAYING" && !isMyTurn) ||
+    (roomStatus === "PLAYING" && (!isMyTurn || !isValid)) ||
     (roomStatus !== "PLAYING" && roomStatus !== "DISTRIBUTING");
+
+  let cardStyle = "";
+  if (roomStatus === "PLAYING") {
+    if (isMyTurn) {
+      if (isValid) {
+        cardStyle = "border-emerald-400 ring-2 ring-emerald-500/30 shadow-[0_0_12px_rgba(52,211,153,0.3)] scale-[1.02] z-10 hover:scale-[1.08] hover:-translate-y-2";
+      } else {
+        cardStyle = "opacity-35 border-slate-800 scale-95 pointer-events-none";
+      }
+    } else {
+      cardStyle = "opacity-75 border-slate-700/60";
+    }
+  } else if (roomStatus === "DISTRIBUTING") {
+    cardStyle = isSelected ? "active-player scale-[1.02] -translate-y-2" : "border-teal-600/60 hover:border-emerald-400";
+  } else {
+    cardStyle = "opacity-85 border-teal-600/40";
+  }
 
   return (
     <button
@@ -913,9 +934,7 @@ const PlayingCardButton = React.memo(function PlayingCardButton({
       onContextMenu={(e) => e.preventDefault()}
       onClick={handleInteraction}
       disabled={isDisabled}
-      className={`playing-card relative ${
-        isSelected ? "active-player" : ""
-      } ${isMyTurn && roomStatus === "PLAYING" ? "border-emerald-400" : "opacity-85"}`}
+      className={`playing-card relative transition-all duration-300 ${cardStyle}`}
     >
       <div className="flex flex-col h-full justify-between">
         <div className="flex justify-between items-start w-full">

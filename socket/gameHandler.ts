@@ -229,6 +229,63 @@ export function registerSocketHandlers(io: Server) {
       io.to(roomId).emit("game:msg", { message, timestamp: new Date().toLocaleTimeString() });
     };
 
+    // Helper to save game state to DB when requested or on auto-vote
+    const triggerGameSave = async (room: Room) => {
+      logToRoom(room.id, `💾 Wszystkie głosy za zapisaniem gry zostały zebrane! Gra jest zapisywana w bazie danych...`);
+      
+      try {
+        let savedGame;
+        if (room.restoredFromSavedGameId) {
+          try {
+            savedGame = await prisma.savedGame.update({
+              where: { id: room.restoredFromSavedGameId },
+              data: {
+                mode: room.mode,
+                status: room.status,
+                players: JSON.stringify(room.players),
+                gameState: JSON.stringify(room.gameState),
+              }
+            });
+            logToRoom(room.id, `✅ Stan zapisu gry zaktualizowany pomyślnie!`);
+          } catch (updateErr) {
+            console.warn("Failed to update existing saved game, creating new one:", updateErr);
+            savedGame = await prisma.savedGame.create({
+              data: {
+                mode: room.mode,
+                status: room.status,
+                players: JSON.stringify(room.players),
+                gameState: JSON.stringify(room.gameState),
+              }
+            });
+            logToRoom(room.id, `✅ Gra pomyślnie zapisana!`);
+          }
+        } else {
+          savedGame = await prisma.savedGame.create({
+            data: {
+              mode: room.mode,
+              status: room.status,
+              players: JSON.stringify(room.players),
+              gameState: JSON.stringify(room.gameState),
+            }
+          });
+          logToRoom(room.id, `✅ Gra pomyślnie zapisana!`);
+        }
+        
+        // Interrupt game
+        room.status = "FINISHED";
+        room.winnerUsername = "GRA_ZAPISANA"; // Special flag indicating game was saved and finished
+        emitRoomState(room);
+        
+        // Delete active room from active memory after a short delay so clients can notice the update
+        setTimeout(() => {
+          delete rooms[room.id];
+        }, 3000);
+      } catch (err) {
+        console.error("Error saving game to database:", err);
+        io.to(room.id).emit("room:error", "Błąd zapisu gry w bazie danych.");
+      }
+    };
+
     // Helper to mask hands of other players
     const emitRoomState = (room: Room) => {
       room.players.forEach((p) => {
@@ -247,6 +304,11 @@ export function registerSocketHandlers(io: Server) {
             ? (!isSkatWinnerForcedBidder || gs.skatWinner === p.username)
             : (gs.skatWinner === p.username)
         ) : false;
+
+        const playerHand = gs?.hands[p.username] || [];
+        const validCards = gs && room.status === "PLAYING" && gs.currentTurn === p.username
+          ? getValidCardsToPlay(playerHand, gs.currentTrick, gs.trump).map((c) => c.id)
+          : [];
 
         // Clone state to protect secret cards
         const maskedState = {
@@ -278,6 +340,7 @@ export function registerSocketHandlers(io: Server) {
                 // Send only this specific player's hand
                 hand: room.gameState.hands[p.username] || [],
                 hasUsedBomb: room.gameState.hasUsedBomb || {},
+                validCardIds: validCards,
               }
             : null,
         };
@@ -339,6 +402,12 @@ export function registerSocketHandlers(io: Server) {
       if (existingIdx !== -1) {
         const wasDisconnected = !room.players[existingIdx].socketId;
         room.players[existingIdx].socketId = socket.id;
+        
+        // Reset save vote to false when they reconnect so they can vote again in future save votes!
+        if (room.saveVotes && room.saveVotes[username] !== undefined) {
+          room.saveVotes[username] = false;
+        }
+
         if (room.status === "LOBBY") {
           room.players[existingIdx].ready = true;
         } else if (wasDisconnected) {
@@ -1077,8 +1146,19 @@ export function registerSocketHandlers(io: Server) {
     }
 
     function executeBotTurn(room: Room, bot: Player) {
-      if (!room.gameState) return;
+      if (room.status === "FINISHED" || !room.gameState) return;
       const gs = room.gameState;
+
+      // Concurrency & Race Condition Safety Guards:
+      // A. Bot must exist and be in the room
+      const isPlayer = room.players.some((p) => p.username === bot.username);
+      if (!isPlayer) return;
+      // B. Ensure it is currently this bot's turn to play/bid
+      if (room.status === "PLAYING" && gs.currentTurn !== bot.username) return;
+      if (room.status === "BIDDING") {
+        const bidder = room.players[gs.bidding.currentBidderIndex];
+        if (!bidder || bidder.username !== bot.username) return;
+      }
 
       // Helper function to estimate hand strength in points (takes initial 7 cards or 10 cards)
       function estimateHandStrength(hand: Card[]): number {
@@ -1316,29 +1396,23 @@ export function registerSocketHandlers(io: Server) {
           return hasK && hasQ && (c.value === "K" || c.value === "Q");
         };
 
-        // Helper to check if any opponent has a higher card of the same suit in their hand, or can trump us
+        // Peeking-free helper to check if card is the highest remaining of its suit.
+        // It only inspects the bot's own hand, respecting players' privacy.
         const isHighestRemainingInSuit = (card: Card): boolean => {
           const valueRank = RANK_ORDER[card.value];
-          // Check if any opponent holds a higher card of this suit
-          const opponentHoldsHigher = Object.entries(gs.hands).some(([username, opponentHand]) => {
-            if (username === bot.username) return false;
-            return opponentHand.some((c) => c.suit === card.suit && RANK_ORDER[c.value] > valueRank);
-          });
-          if (opponentHoldsHigher) return false;
+          
+          // Determine which ranks are higher than this card
+          const higherRanks = Object.keys(RANK_ORDER).filter(
+            (val) => RANK_ORDER[val as Card["value"]] > valueRank
+          ) as Card["value"][];
 
-          // If trump is active, and we are not playing a trump card
-          if (gs.trump && card.suit !== gs.trump) {
-            // Check if any opponent is void in this suit AND holds at least one trump
-            const opponentCanTrump = Object.entries(gs.hands).some(([username, opponentHand]) => {
-              if (username === bot.username) return false;
-              const hasSuit = opponentHand.some((c) => c.suit === card.suit);
-              const hasTrump = opponentHand.some((c) => c.suit === gs.trump);
-              return !hasSuit && hasTrump;
-            });
-            if (opponentCanTrump) return false;
-          }
+          // If the bot holds all remaining higher cards of this suit in its own hand,
+          // then no opponent can hold a higher card of this suit.
+          const botHoldsAllHigher = higherRanks.every((highVal) =>
+            hand.some((c) => c.suit === card.suit && c.value === highVal)
+          );
 
-          return true;
+          return botHoldsAllHigher;
         };
 
         // If leading the trick
@@ -1511,7 +1585,24 @@ export function registerSocketHandlers(io: Server) {
             }
           } else {
             logToRoom(room.id, `🔌 Gracz ${username} utracił połączenie. Oczekiwanie na powrót (45s)...`);
+            
+            // Auto-vote yes for saving on behalf of the disconnected user
+            if (!room.saveVotes) {
+              room.saveVotes = {};
+              room.players.forEach((p) => {
+                room.saveVotes![p.username] = p.isBot ? true : false;
+              });
+            }
+            room.saveVotes[username] = true;
+            logToRoom(room.id, `⚙️ Uruchomiono automatyczny głos "TAK" dla ${username} w głosowaniu nad zapisaniem stanu gry.`);
+            
             emitRoomState(room);
+
+            // Check if this auto-vote completes the save requirement (e.g. if others already voted)
+            const allVoted = room.players.every((p) => room.saveVotes?.[p.username]);
+            if (allVoted) {
+              triggerGameSave(room);
+            }
             
             // Set 45s grace period for active games
             setTimeout(() => {
@@ -1590,59 +1681,7 @@ export function registerSocketHandlers(io: Server) {
       // Check if all players have voted
       const allVoted = room.players.every((p) => room.saveVotes?.[p.username]);
       if (allVoted) {
-        logToRoom(room.id, `💾 Wszyscy gracze zagłosowali za zapisaniem gry! Gra jest zapisywana w bazie danych...`);
-        
-        try {
-          let savedGame;
-          if (room.restoredFromSavedGameId) {
-            try {
-              savedGame = await prisma.savedGame.update({
-                where: { id: room.restoredFromSavedGameId },
-                data: {
-                  mode: room.mode,
-                  status: room.status,
-                  players: JSON.stringify(room.players),
-                  gameState: JSON.stringify(room.gameState),
-                }
-              });
-              logToRoom(room.id, `✅ Stan zapisu gry zaktualizowany pomyślnie!`);
-            } catch (updateErr) {
-              console.warn("Failed to update existing saved game, creating new one:", updateErr);
-              savedGame = await prisma.savedGame.create({
-                data: {
-                  mode: room.mode,
-                  status: room.status,
-                  players: JSON.stringify(room.players),
-                  gameState: JSON.stringify(room.gameState),
-                }
-              });
-              logToRoom(room.id, `✅ Gra pomyślnie zapisana!`);
-            }
-          } else {
-            savedGame = await prisma.savedGame.create({
-              data: {
-                mode: room.mode,
-                status: room.status,
-                players: JSON.stringify(room.players),
-                gameState: JSON.stringify(room.gameState),
-              }
-            });
-            logToRoom(room.id, `✅ Gra pomyślnie zapisana!`);
-          }
-          
-          // Interrupt game
-          room.status = "FINISHED";
-          room.winnerUsername = "GRA_ZAPISANA"; // Special flag indicating game was saved and finished
-          emitRoomState(room);
-          
-          // Delete active room from active memory after a short delay so clients can notice the update
-          setTimeout(() => {
-            delete rooms[room.id];
-          }, 3000);
-        } catch (err) {
-          console.error("Error saving game to database:", err);
-          socket.emit("room:error", "Błąd zapisu gry w bazie danych.");
-        }
+        await triggerGameSave(room);
       }
     });
 
