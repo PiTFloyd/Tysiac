@@ -35,6 +35,7 @@ export interface GameState {
   skat: Card[]; // Skat cards (visible if revealed/won)
   hasUsedBomb?: Record<string, boolean>;
   validCardIds?: string[];
+  skatCardIds?: string[];
 }
 
 export interface Room {

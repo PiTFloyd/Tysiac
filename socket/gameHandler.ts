@@ -128,6 +128,7 @@ export interface GameState {
   firstPlayerOfTrick: string | null;
   tricksCount: number;
   hasUsedBomb: Record<string, boolean>;
+  skatCardIds: string[];
 }
 
 export interface Room {
@@ -341,6 +342,7 @@ export function registerSocketHandlers(io: Server) {
                 hand: room.gameState.hands[p.username] || [],
                 hasUsedBomb: room.gameState.hasUsedBomb || {},
                 validCardIds: validCards,
+                skatCardIds: room.gameState.skatCardIds || [],
               }
             : null,
         };
@@ -515,6 +517,7 @@ export function registerSocketHandlers(io: Server) {
       gs.hands[p2] = shuffled.slice(7, 14);
       gs.hands[p3] = shuffled.slice(14, 21);
       gs.skat = shuffled.slice(21, 24);
+      gs.skatCardIds = gs.skat.map((c) => c.id);
 
       // Reset round states
       room.players.forEach((p) => {
@@ -585,6 +588,7 @@ export function registerSocketHandlers(io: Server) {
         firstPlayerOfTrick: null,
         tricksCount: 0,
         hasUsedBomb: { [p1]: false, [p2]: false, [p3]: false },
+        skatCardIds: [],
       };
 
       room.saveVotes = {};
@@ -652,19 +656,21 @@ export function registerSocketHandlers(io: Server) {
           logToRoom(room.id, `Licytację wygrywa ${winner.username} z ofertą ${bidding.highestBid}! Odkrywanie musika (skata)...`);
           emitRoomState(room);
 
-          // Reveal Skat automatically
-          setTimeout(() => {
-            if (room.status === "SKAT_REVEAL" && room.gameState) {
-              room.gameState.skatSeen = true;
-              // Winner takes the 3 skat cards into their hand
-              room.gameState.hands[winner.username].push(...room.gameState.skat);
-              room.gameState.skat = [];
-              room.status = "DISTRIBUTING";
-              logToRoom(room.id, `${winner.username} pobrał musik. Musi teraz oddać po jednej karcie pozostałym graczom.`);
-              emitRoomState(room);
-              checkAndRunBotAction(room);
-            }
-          }, 3000);
+          // Reveal Skat automatically only if the winner is a bot
+          if (winner.isBot) {
+            setTimeout(() => {
+              if (room.status === "SKAT_REVEAL" && room.gameState) {
+                room.gameState.skatSeen = true;
+                // Winner takes the 3 skat cards into their hand
+                room.gameState.hands[winner.username].push(...room.gameState.skat);
+                room.gameState.skat = [];
+                room.status = "DISTRIBUTING";
+                logToRoom(room.id, `Bot ${winner.username} pobrał musik.`);
+                emitRoomState(room);
+                checkAndRunBotAction(room);
+              }
+            }, 3000);
+          }
         }
       } else {
         // Find next active bidder
@@ -725,6 +731,32 @@ export function registerSocketHandlers(io: Server) {
         logToRoom(room.id, `📉 ${username} obniżył wartość gry z ${oldBid} na ${newBid} pkt!`);
       }
       emitRoomState(room);
+    });
+
+    // Take Skat / Dismiss Skat Reveal action
+    socket.on("game:take_skat", ({ roomId }: { roomId: string }) => {
+      const room = rooms[roomId?.toUpperCase()];
+      if (!room || !room.gameState || room.status !== "SKAT_REVEAL") return;
+
+      const gs = room.gameState;
+      const winner = room.players.find((p) => p.username === gs.skatWinner);
+      const isWinnerBot = winner ? winner.isBot : false;
+
+      // Only the skatWinner can take the skat, but if the skatWinner is a bot, allow any player to trigger it
+      if (gs.skatWinner !== username && !isWinnerBot) {
+        socket.emit("room:error", "Tylko zwycięzca licytacji może pobrać musik.");
+        return;
+      }
+
+      gs.skatSeen = true;
+      if (winner && gs.skat.length > 0) {
+        gs.hands[winner.username].push(...gs.skat);
+        gs.skat = [];
+      }
+      room.status = "DISTRIBUTING";
+      logToRoom(room.id, `${gs.skatWinner} pobrał musik. Musi teraz oddać po jednej karcie pozostałym graczom.`);
+      emitRoomState(room);
+      checkAndRunBotAction(room);
     });
 
     // Bomb action (bomba)

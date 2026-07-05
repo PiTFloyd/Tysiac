@@ -12,6 +12,22 @@ interface GameTableProps {
   onBackToLobby: () => void;
 }
 
+const VALUE_RANKS: Record<string, number> = {
+  "A": 6,
+  "10": 5,
+  "K": 4,
+  "Q": 3,
+  "J": 2,
+  "9": 1
+};
+
+const SUIT_RANKS: Record<string, number> = {
+  "H": 4, // Kier (Hearts)
+  "D": 3, // Karo (Diamonds)
+  "C": 2, // Trefl (Clubs)
+  "S": 1  // Pik (Spades)
+};
+
 export default function GameTable({ socket, roomId, user, onBackToLobby }: GameTableProps) {
   const [room, setRoom] = useState<Room | null>(null);
   const [logs, setLogs] = useState<{ message: string; timestamp: string }[]>([]);
@@ -20,6 +36,15 @@ export default function GameTable({ socket, roomId, user, onBackToLobby }: GameT
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [activeMelds, setActiveMelds] = useState<Record<string, { points: number; id: string }>>({});
+  const [cardSorting, setCardSorting] = useState<'default' | 'value_desc' | 'suit_desc'>('default');
+  const [draftDistributions, setDraftDistributions] = useState<Record<string, Card>>({});
+  const [isSubmittingDistribution, setIsSubmittingDistribution] = useState(false);
+
+  useEffect(() => {
+    if (room?.status !== "DISTRIBUTING") {
+      setDraftDistributions({});
+    }
+  }, [room?.status]);
 
   useEffect(() => {
     const handleFullscreenChange = () => {
@@ -135,6 +160,34 @@ export default function GameTable({ socket, roomId, user, onBackToLobby }: GameT
   const gameState = room?.gameState;
   const isMyTurn = gameState?.currentTurn === user.username;
 
+  const getSortedHand = React.useCallback(() => {
+    if (!gameState?.hand) return [];
+    
+    // Filter out any cards that are in draftDistributions values
+    const assignedCardIds = Object.keys(draftDistributions).map((k) => draftDistributions[k]?.id).filter(Boolean);
+    const handCopy = gameState.hand.filter((c) => !assignedCardIds.includes(c.id));
+    
+    if (cardSorting === 'default') {
+      // Unsorted / raw random order as received from the server
+      return handCopy;
+    } else if (cardSorting === 'value_desc') {
+      // Value DESC, Suit DESC
+      return handCopy.sort((a, b) => {
+        const valDiff = (VALUE_RANKS[b.value] || 0) - (VALUE_RANKS[a.value] || 0);
+        if (valDiff !== 0) return valDiff;
+        return (SUIT_RANKS[b.suit] || 0) - (SUIT_RANKS[a.suit] || 0);
+      });
+    } else if (cardSorting === 'suit_desc') {
+      // Suit ASC, Value DESC
+      return handCopy.sort((a, b) => {
+        const suitDiff = (SUIT_RANKS[a.suit] || 0) - (SUIT_RANKS[b.suit] || 0);
+        if (suitDiff !== 0) return suitDiff;
+        return (VALUE_RANKS[b.value] || 0) - (VALUE_RANKS[a.value] || 0);
+      });
+    }
+    return handCopy;
+  }, [gameState?.hand, cardSorting, draftDistributions]);
+
   // Clear any stale long-press/touch flags when our turn changes or the trick advances
   useEffect(() => {
     isLongPressRef.current = {};
@@ -166,12 +219,50 @@ export default function GameTable({ socket, roomId, user, onBackToLobby }: GameT
     socket.emit("room:start", { roomId });
   }, [socket, roomId]);
 
-  // Distribute card action
-  const handleDistribute = React.useCallback((targetUsername: string) => {
-    if (!selectedCardId) return;
-    socket.emit("game:distribute", { roomId, cardId: selectedCardId, targetUsername });
+  // Local distribution draft actions
+  const handleAssignCardLocal = React.useCallback((targetUsername: string) => {
+    if (!selectedCardId || !gameState?.hand) return;
+    const card = gameState.hand.find((c) => c.id === selectedCardId);
+    if (!card) return;
+
+    // Check if already assigned
+    const alreadyAssigned = Object.keys(draftDistributions).some((k) => draftDistributions[k]?.id === card.id);
+    if (alreadyAssigned) return;
+
+    setDraftDistributions((prev) => ({
+      ...prev,
+      [targetUsername]: card
+    }));
     setSelectedCardId(null);
-  }, [socket, roomId, selectedCardId]);
+  }, [selectedCardId, gameState?.hand, draftDistributions]);
+
+  const handleRemoveCardLocal = React.useCallback((targetUsername: string) => {
+    setDraftDistributions((prev) => {
+      const next = { ...prev };
+      delete next[targetUsername];
+      return next;
+    });
+  }, []);
+
+  const handleConfirmDistribution = React.useCallback(() => {
+    const otherPlayers = room?.players.filter((p) => p.username !== user.username) || [];
+    if (otherPlayers.length < 2) return;
+
+    const cardA = draftDistributions[otherPlayers[0].username];
+    const cardB = draftDistributions[otherPlayers[1].username];
+
+    if (!cardA || !cardB) return;
+
+    setIsSubmittingDistribution(true);
+
+    // Send both sequentially with a tiny delay to ensure proper state processing
+    socket.emit("game:distribute", { roomId, cardId: cardA.id, targetUsername: otherPlayers[0].username });
+    
+    setTimeout(() => {
+      socket.emit("game:distribute", { roomId, cardId: cardB.id, targetUsername: otherPlayers[1].username });
+      setIsSubmittingDistribution(false);
+    }, 80);
+  }, [socket, roomId, room?.players, draftDistributions, user.username]);
 
   const handleIncreaseBid = React.useCallback((newBid: number) => {
     socket.emit("game:increase_bid", { roomId, newBid });
@@ -179,6 +270,10 @@ export default function GameTable({ socket, roomId, user, onBackToLobby }: GameT
 
   const handleBomba = React.useCallback(() => {
     socket.emit("game:bomba", { roomId });
+  }, [socket, roomId]);
+
+  const handleCloseSkat = React.useCallback(() => {
+    socket.emit("game:take_skat", { roomId });
   }, [socket, roomId]);
 
   const handleSaveGame = React.useCallback(() => {
@@ -590,28 +685,32 @@ export default function GameTable({ socket, roomId, user, onBackToLobby }: GameT
 
             {/* BIDDING OVERLAY */}
             {room.status === "BIDDING" && gameState && (
-              <div className="absolute text-center p-4 bg-gray-950 border border-teal-900 rounded-xl max-w-xs shadow-2xl z-20 neon-border">
-                <Layers className="h-6 w-6 text-emerald-400 mx-auto mb-1" />
-                <span className="text-[9px] font-mono text-teal-500 uppercase tracking-widest">Licytacja</span>
-                <p className="text-xs font-bold text-white mb-3">Wysokość: <span className="text-yellow-400 font-mono">{gameState.bidding.highestBid} pkt</span></p>
+              <div className="absolute w-64 h-64 flex flex-col justify-center items-center p-5 bg-gray-950 border border-teal-900 rounded-2xl shadow-2xl z-20 neon-border text-center">
+                <Layers className="h-9 w-9 text-emerald-400 mb-1 animate-bounce" />
+                <span className="text-[10px] font-mono text-teal-500 uppercase tracking-widest block mb-0.5">Licytacja</span>
+                <p className="text-xs font-bold text-white mb-4">
+                  Wysokość: <span className="text-yellow-400 font-mono text-base font-black">{gameState.bidding.highestBid} pkt</span>
+                </p>
 
                 {isMyTurn ? (
-                  <div className="flex gap-2">
+                  <div className="flex gap-2 w-full mt-1">
                     <button
                       onClick={() => handleBid(gameState.bidding.minBid)}
-                      className="flex-1 py-1.5 bg-emerald-500 hover:bg-emerald-400 text-gray-950 font-bold text-[10px] uppercase rounded-lg cursor-pointer"
+                      className="flex-1 py-2 bg-emerald-500 hover:bg-emerald-400 text-gray-950 font-bold text-[11px] uppercase rounded-lg cursor-pointer transition-all active:scale-[0.97]"
                     >
                       Licytuj {gameState.bidding.minBid}
                     </button>
                     <button
                       onClick={handlePass}
-                      className="flex-1 py-1.5 bg-gray-900 border border-red-500/20 text-red-400 text-[10px] uppercase rounded-lg cursor-pointer"
+                      className="flex-1 py-2 bg-gray-900 border border-red-500/25 text-red-400 hover:bg-red-950/20 text-[11px] uppercase rounded-lg cursor-pointer transition-all active:scale-[0.97]"
                     >
                       Pas
                     </button>
                   </div>
                 ) : (
-                  <span className="text-[9px] font-mono text-teal-600 animate-pulse">Ruch: {gameState.currentTurn}</span>
+                  <span className="text-[10px] font-mono text-teal-600 animate-pulse bg-teal-950/20 px-3 py-1.5 border border-teal-950/40 rounded-lg">
+                    Ruch: {gameState.currentTurn}
+                  </span>
                 )}
               </div>
             )}
@@ -625,15 +724,37 @@ export default function GameTable({ socket, roomId, user, onBackToLobby }: GameT
               const isSkatHidden = isSkatWinnerForcedBidder && gameState.bidding.highestBid === 100 && gameState.skatWinner !== user.username;
 
               return (
-                <div className="absolute text-center p-4 bg-gray-950 border border-teal-900 rounded-xl z-20 neon-border max-w-xs">
-                  <span className="text-[9px] font-mono text-yellow-400 uppercase tracking-widest block mb-1">Musik (Skat)</span>
-                  <p className="text-[10px] text-slate-300 font-semibold mb-3">{gameState.skatWinner} zgarnia musik!</p>
-                  <div className="flex gap-2 justify-center">
+                <div className="absolute w-[340px] min-h-[250px] flex flex-col justify-center items-center p-5 bg-gray-950 border border-teal-900 rounded-2xl shadow-2xl z-20 neon-border text-center relative">
+                  {/* Close button 'x' available to the skat winner (or any player if skat winner is a bot) */}
+                  {(() => {
+                    const winner = room.players.find((p) => p.username === gameState.skatWinner);
+                    const isWinnerBot = winner ? winner.isBot : false;
+                    const canClose = gameState.skatWinner === user.username || isWinnerBot;
+                    if (canClose) {
+                      return (
+                        <button
+                          onClick={handleCloseSkat}
+                          className="absolute top-2.5 right-2.5 w-6 h-6 flex items-center justify-center rounded-full bg-gray-900 border border-teal-900/60 hover:border-emerald-500 hover:text-emerald-400 text-slate-400 font-extrabold text-xs cursor-pointer transition-all active:scale-95"
+                          title="Zamknij podgląd i pobierz musik"
+                        >
+                          ✕
+                        </button>
+                      );
+                    }
+                    return null;
+                  })()}
+
+                  <span className="text-[11px] font-mono text-yellow-400 uppercase tracking-widest block mb-1">Musik (Skat)</span>
+                  <p className="text-xs text-slate-200 font-bold mb-4 leading-normal">
+                    {gameState.skatWinner === user.username ? "Wygrałeś licytację i zgarniasz musik!" : `${gameState.skatWinner} zgarnia musik!`}
+                  </p>
+                  
+                  <div className="flex gap-2.5 justify-center mb-1">
                     {isSkatHidden ? (
                       <>
                         {[1, 2, 3].map((i) => (
-                          <div key={i} className="w-[50px] h-[80px] bg-gradient-to-br from-teal-950 to-gray-900 border border-teal-500/30 rounded flex flex-col items-center justify-center shadow-md animate-pulse">
-                            <span className="text-teal-500 text-lg">❓</span>
+                          <div key={i} className="w-[60px] h-[92px] bg-gradient-to-br from-teal-950 to-gray-900 border border-teal-500/30 rounded-xl flex flex-col items-center justify-center shadow-md animate-pulse">
+                            <span className="text-teal-500 text-xl">❓</span>
                           </div>
                         ))}
                       </>
@@ -641,84 +762,163 @@ export default function GameTable({ socket, roomId, user, onBackToLobby }: GameT
                       gameState.skat.map((c) => {
                         const suitInfo = getCardSuitDetails(c.suit);
                         return (
-                          <div key={c.id} className="w-[50px] h-[80px] bg-gray-900 border border-yellow-500/40 rounded flex flex-col justify-between p-1 shadow-md">
-                            <span className={`text-[11px] font-bold text-left self-start ${suitInfo?.color}`}>{c.value}</span>
-                            <span className={`text-base text-center font-bold ${suitInfo?.color}`}>{suitInfo?.symbol}</span>
-                            <span className={`text-[11px] font-bold text-right self-end ${suitInfo?.color}`}>{c.value}</span>
+                          <div key={c.id} className="w-[60px] h-[92px] bg-gray-900 border-2 border-emerald-500/30 rounded-xl flex flex-col justify-between p-1.5 shadow-md select-none">
+                            <span className={`text-xs font-black text-left self-start leading-none ${suitInfo?.color}`}>{c.value}</span>
+                            <span className={`text-xl text-center leading-none ${suitInfo?.color}`}>{suitInfo?.symbol}</span>
+                            <span className={`text-xs font-black text-right self-end rotate-180 leading-none ${suitInfo?.color}`}>{c.value}</span>
                           </div>
                         );
                       })
                     )}
                   </div>
+                  
                   {isSkatHidden && (
-                    <p className="text-[9px] text-teal-500 mt-2 italic">Licytacja przymusowa – musik ukryty przed innymi</p>
+                    <p className="text-[9px] text-teal-500 mt-2 italic leading-tight">Licytacja przymusowa – musik ukryty przed innymi</p>
                   )}
+
+                  <div className="w-full mt-3">
+                    {gameState.skatWinner === user.username ? (
+                      <button
+                        onClick={handleCloseSkat}
+                        className="w-full py-2 bg-emerald-500 hover:bg-emerald-400 text-gray-950 font-black text-xs uppercase rounded-xl cursor-pointer transition-all active:scale-[0.97] shadow-[0_0_15px_rgba(16,185,129,0.25)]"
+                      >
+                        Pobierz musik & Rozdaj karty
+                      </button>
+                    ) : (
+                      <span className="text-[10px] font-mono text-teal-500 animate-pulse bg-teal-950/15 px-3 py-1.5 border border-teal-950/30 rounded-lg inline-block">
+                        Czekaj na pobranie musika przez licytatora...
+                      </span>
+                    )}
+                  </div>
                 </div>
               );
             })()}
 
             {/* DISTRIBUTING */}
             {room.status === "DISTRIBUTING" && gameState && (
-              <div className="absolute text-center p-4 bg-gray-950 border border-teal-900 rounded-xl z-20 neon-border max-w-xs">
-                <span className="text-[9px] font-mono text-teal-500 uppercase tracking-widest block mb-1">Oddaj Karty</span>
-                <p className="text-[10px] text-slate-300 mb-3">
-                  {gameState.skatWinner === user.username
-                    ? "Zaznacz kartę i przekaż ją rywalom."
-                    : `Licytator (${gameState.skatWinner}) rozdaje karty...`}
-                </p>
+              <div className="absolute w-72 min-h-[320px] flex flex-col justify-between items-center p-4 bg-gray-950 border border-teal-900 rounded-2xl shadow-2xl z-20 neon-border text-center">
+                <div className="w-full">
+                  <span className="text-[10px] font-mono text-teal-500 uppercase tracking-widest block mb-0.5">Oddaj Karty</span>
+                  <p className="text-[10px] text-slate-400 leading-tight">
+                    {gameState.skatWinner === user.username
+                      ? "Przypisz po jednej karcie każdemu z rywali."
+                      : `Licytator (${gameState.skatWinner}) rozdaje karty...`}
+                  </p>
+                </div>
 
-                {gameState.skatWinner === user.username && (
-                  <div className="space-y-3">
-                    <div className="space-y-1 bg-teal-950/20 p-2 border border-teal-900/40 rounded-lg">
-                      <span className="text-[9px] font-mono text-teal-500 uppercase tracking-widest block">Ugraj wyższy kontrakt</span>
-                      <p className="text-[9px] text-teal-600">Dostosuj stawkę (min. {gameState.bidding.originalBid || 100} pkt):</p>
-                      <div className="flex items-center justify-between mt-2 bg-gray-900 border border-teal-900/60 rounded-lg p-1 max-w-[180px] mx-auto shadow-inner">
+                {gameState.skatWinner === user.username ? (
+                  <div className="w-full flex-1 flex flex-col justify-between gap-3 mt-3">
+                    {/* Contract Box */}
+                    <div className="bg-teal-950/20 p-2 border border-teal-900/40 rounded-xl">
+                      <span className="text-[9px] font-mono text-teal-500 uppercase tracking-widest block text-center mb-1">Deklaracja kontraktu</span>
+                      <div className="flex items-center justify-between bg-gray-900 border border-teal-900/60 rounded-lg p-0.5 max-w-[180px] mx-auto shadow-inner">
                         <button
                           disabled={gameState.bidding.highestBid <= (gameState.bidding.originalBid || 100)}
                           onClick={() => handleIncreaseBid(gameState.bidding.highestBid - 10)}
-                          className="w-8 h-8 flex items-center justify-center text-sm font-bold text-slate-300 hover:text-emerald-400 disabled:opacity-30 disabled:hover:text-slate-300 rounded transition-colors cursor-pointer select-none"
-                          title="Obniż stawkę kontraktu o 10"
+                          className="w-7 h-7 flex items-center justify-center text-xs font-bold text-slate-300 hover:text-emerald-400 disabled:opacity-30 disabled:hover:text-slate-300 rounded transition-colors cursor-pointer select-none"
                         >
                           −
                         </button>
-                        <span className="text-xs font-mono font-bold text-emerald-400 px-2 min-w-[70px] text-center">
+                        <span className="text-xs font-mono font-bold text-emerald-400 px-1 min-w-[70px] text-center">
                           {gameState.bidding.highestBid} pkt
                         </span>
                         <button
                           disabled={gameState.bidding.highestBid >= 300}
                           onClick={() => handleIncreaseBid(gameState.bidding.highestBid + 10)}
-                          className="w-8 h-8 flex items-center justify-center text-sm font-bold text-slate-300 hover:text-emerald-400 disabled:opacity-30 disabled:hover:text-slate-300 rounded transition-colors cursor-pointer select-none"
-                          title="Podnieś stawkę kontraktu o 10"
+                          className="w-7 h-7 flex items-center justify-center text-xs font-bold text-slate-300 hover:text-emerald-400 disabled:opacity-30 disabled:hover:text-slate-300 rounded transition-colors cursor-pointer select-none"
                         >
                           +
                         </button>
                       </div>
                     </div>
 
-                    <div className="space-y-2">
-                      <span className="text-[9px] font-mono text-teal-500 uppercase tracking-widest block border-t border-teal-900/20 pt-1.5">Oddaj karty rywalom</span>
-                      {!selectedCardId ? (
-                        <p className="text-[9px] text-yellow-500 font-bold">Wybierz kartę ze swojej ręki.</p>
+                    {/* Opponent Assignments */}
+                    <div className="flex flex-col gap-2 w-full text-left">
+                      <span className="text-[9px] font-mono text-teal-500 uppercase tracking-widest block text-center border-t border-teal-900/20 pt-2 mb-1">
+                        Rozdział kart
+                      </span>
+                      
+                      <div className="flex flex-col gap-1.5 w-full">
+                        {room.players
+                          .filter((p) => p.username !== user.username)
+                          .map((p) => {
+                            const assignedCard = draftDistributions[p.username];
+                            const suitInfo = assignedCard ? getCardSuitDetails(assignedCard.suit) : null;
+                            
+                            return (
+                              <div key={p.username} className="w-full">
+                                {assignedCard ? (
+                                  <button
+                                    onClick={() => handleRemoveCardLocal(p.username)}
+                                    className="w-full flex items-center justify-between px-3 py-1.5 bg-teal-950/30 border border-amber-500/40 hover:border-amber-400 rounded-lg text-xs font-bold text-slate-200 cursor-pointer group transition-all"
+                                    title="Kliknij, aby wycofać kartę"
+                                  >
+                                    <span className="flex items-center gap-1.5 truncate">
+                                      <span className="text-slate-400 font-mono font-medium group-hover:text-amber-400 transition-colors">
+                                        {p.username.slice(0, 8)}:
+                                      </span>
+                                      <span className={`font-black font-mono flex items-center gap-0.5 ${suitInfo?.color}`}>
+                                        {assignedCard.value}{suitInfo?.symbol}
+                                      </span>
+                                    </span>
+                                    <span className="text-[9px] text-amber-500 uppercase font-mono tracking-wider opacity-60 group-hover:opacity-100 transition-opacity">
+                                      Cofnij
+                                    </span>
+                                  </button>
+                                ) : (
+                                  <button
+                                    onClick={() => {
+                                      if (selectedCardId) {
+                                        handleAssignCardLocal(p.username);
+                                      }
+                                    }}
+                                    disabled={!selectedCardId}
+                                    className={`w-full flex items-center justify-between px-3 py-1.5 rounded-lg text-xs font-bold border transition-all ${
+                                      selectedCardId
+                                        ? 'bg-gray-900 border-teal-500 hover:border-emerald-400 text-slate-200 cursor-pointer active:scale-[0.98]'
+                                        : 'bg-gray-900/40 border-slate-800 text-slate-500 cursor-not-allowed'
+                                    }`}
+                                    title={selectedCardId ? "Przypisz zaznaczoną kartę" : "Najpierw zaznacz kartę ze swojej ręki"}
+                                  >
+                                    <span className="truncate text-slate-400">
+                                      {p.username.slice(0, 8)}
+                                    </span>
+                                    <span className="text-[9px] font-mono uppercase tracking-wider text-teal-600 animate-pulse">
+                                      {selectedCardId ? "Daj kartę" : "Wybierz kartę"}
+                                    </span>
+                                  </button>
+                                )}
+                              </div>
+                            );
+                          })}
+                      </div>
+                    </div>
+
+                    {/* Confirm Button / Selection Helper */}
+                    <div className="w-full mt-1">
+                      {Object.keys(draftDistributions).length === 2 ? (
+                        <button
+                          disabled={isSubmittingDistribution}
+                          onClick={handleConfirmDistribution}
+                          className="w-full py-2 bg-emerald-500 hover:bg-emerald-400 disabled:bg-gray-800 disabled:text-slate-600 text-gray-950 font-black text-xs uppercase rounded-xl cursor-pointer transition-all active:scale-[0.97] shadow-[0_0_15px_rgba(16,185,129,0.25)] flex items-center justify-center gap-2"
+                        >
+                          {isSubmittingDistribution ? (
+                            <span className="animate-spin w-3.5 h-3.5 border-2 border-gray-950 border-t-transparent rounded-full" />
+                          ) : null}
+                          Potwierdź rozdanie
+                        </button>
                       ) : (
-                        <div className="flex gap-1.5 justify-center">
-                          {room.players
-                            .filter((p) => p.username !== user.username)
-                            .map((p) => {
-                              const hasReceived = (gameState as any).distributedTo?.includes(p.username);
-                              return (
-                                <button
-                                  key={p.username}
-                                  disabled={hasReceived}
-                                  onClick={() => handleDistribute(p.username)}
-                                  className="px-2.5 py-1 bg-gray-900 border border-teal-900 text-[9px] font-bold text-slate-200 hover:border-emerald-400 rounded transition-all cursor-pointer disabled:opacity-30"
-                                >
-                                  {p.username}
-                                </button>
-                              );
-                            })}
-                        </div>
+                        <p className="text-[9px] text-yellow-500 font-bold animate-pulse text-center">
+                          {!selectedCardId 
+                            ? "Zaznacz kartę na swojej ręce i przypisz ją rywalowi." 
+                            : "Wybierz rywala, aby przypisać mu zaznaczoną kartę."}
+                        </p>
                       )}
                     </div>
+                  </div>
+                ) : (
+                  <div className="flex-1 flex items-center justify-center mt-4">
+                    <span className="text-[10px] font-mono text-teal-600 animate-pulse bg-teal-950/10 px-3 py-1.5 border border-teal-950/20 rounded-lg">Czekaj na rozdanie...</span>
                   </div>
                 )}
               </div>
@@ -755,12 +955,12 @@ export default function GameTable({ socket, roomId, user, onBackToLobby }: GameT
 
             {/* FINISHED SCREEN */}
             {room.status === "FINISHED" && (
-              <div className="absolute text-center p-4 bg-gray-950 border border-teal-900 rounded-xl z-20 neon-border max-w-xs">
-                <Award className="h-6 w-6 text-yellow-500 mx-auto mb-1 animate-bounce" />
-                <h3 className="font-bold text-xs text-white">Zwycięzca: {room.winnerUsername}</h3>
+              <div className="absolute w-64 h-64 flex flex-col justify-center items-center p-5 bg-gray-950 border border-teal-900 rounded-2xl shadow-2xl z-20 neon-border text-center">
+                <Award className="h-10 w-10 text-yellow-500 mx-auto mb-2 animate-bounce" />
+                <h3 className="font-bold text-sm text-white mb-4">Zwycięzca: {room.winnerUsername}</h3>
                 <button
                   onClick={onBackToLobby}
-                  className="mt-4 w-full py-1.5 bg-emerald-500 hover:bg-emerald-400 text-gray-950 font-bold text-[10px] uppercase rounded"
+                  className="mt-2 w-full py-2 bg-emerald-500 hover:bg-emerald-400 text-gray-950 font-bold text-xs uppercase rounded-lg cursor-pointer transition-all active:scale-[0.97]"
                 >
                   Do lobby
                 </button>
@@ -773,9 +973,9 @@ export default function GameTable({ socket, roomId, user, onBackToLobby }: GameT
             {/* Active Hand Container */}
             <div className="flex gap-1.5 -mb-6 justify-center flex-wrap max-w-full">
               {gameState?.hand && gameState.hand.length > 0 ? (
-                gameState.hand.map((c) => {
+                getSortedHand().map((c) => {
                   const isSelected = selectedCardId === c.id;
-                  const isValid = gameState?.validCardIds ? gameState.validCardIds.includes(c.id) : true;
+                  const isFromSkat = room.status === "DISTRIBUTING" && (gameState.skatCardIds?.includes(c.id) || false);
                   return (
                     <PlayingCardButton
                       key={c.id}
@@ -791,7 +991,7 @@ export default function GameTable({ socket, roomId, user, onBackToLobby }: GameT
                       setSelectedCardId={setSelectedCardId}
                       handlePlayCard={handlePlayCard}
                       isLongPressRef={isLongPressRef}
-                      isValid={isValid}
+                      isFromSkat={isFromSkat}
                     />
                   );
                 })
@@ -828,6 +1028,50 @@ export default function GameTable({ socket, roomId, user, onBackToLobby }: GameT
                   {gameState?.trump === "H" ? "100" : gameState?.trump === "D" ? "80" : gameState?.trump === "C" ? "60" : gameState?.trump === "S" ? "40" : "—"}
                 </p>
               </div>
+            </div>
+          </div>
+
+          {/* Card Sorting (Segregacja kart) Panel */}
+          <div className="bg-gray-900/50 neon-border rounded-2xl p-4 flex flex-col gap-3">
+            <div className="flex items-center justify-between mb-0.5">
+              <span className="text-[11px] font-bold text-emerald-400 uppercase tracking-widest flex items-center gap-2">
+                <span className="w-2 h-2 rounded-full bg-emerald-500 shadow-[0_0_8px_rgba(16,185,129,0.5)]"></span> Segregacja kart
+              </span>
+            </div>
+            <div className="grid grid-cols-3 gap-1.5">
+              <button
+                onClick={() => setCardSorting('default')}
+                className={`py-1.5 text-[10px] font-bold uppercase rounded-lg border transition-all cursor-pointer ${
+                  cardSorting === 'default'
+                    ? 'bg-emerald-500 border-emerald-500 text-gray-950 shadow-[0_0_10px_rgba(16,185,129,0.25)]'
+                    : 'bg-emerald-500/5 hover:bg-emerald-500/10 border-emerald-500/20 text-emerald-400'
+                }`}
+                title="Losowy, nieposortowany układ kart w ręce"
+              >
+                Losowo
+              </button>
+              <button
+                onClick={() => setCardSorting('value_desc')}
+                className={`py-1.5 text-[10px] font-bold uppercase rounded-lg border transition-all cursor-pointer ${
+                  cardSorting === 'value_desc'
+                    ? 'bg-emerald-500 border-emerald-500 text-gray-950 shadow-[0_0_10px_rgba(16,185,129,0.25)]'
+                    : 'bg-emerald-500/5 hover:bg-emerald-500/10 border-emerald-500/20 text-emerald-400'
+                }`}
+                title="Układanie kart według ich siły/wartości (As, 10, Król...)"
+              >
+                Wartość
+              </button>
+              <button
+                onClick={() => setCardSorting('suit_desc')}
+                className={`py-1.5 text-[10px] font-bold uppercase rounded-lg border transition-all cursor-pointer ${
+                  cardSorting === 'suit_desc'
+                    ? 'bg-emerald-500 border-emerald-500 text-gray-950 shadow-[0_0_10px_rgba(16,185,129,0.25)]'
+                    : 'bg-emerald-500/5 hover:bg-emerald-500/10 border-emerald-500/20 text-emerald-400'
+                }`}
+                title="Układanie kart pogrupowanych odwróconymi kolorami (Pik, Trefl, Karo, Kier)"
+              >
+                Kolorami
+              </button>
             </div>
           </div>
         </aside>
@@ -869,7 +1113,7 @@ interface PlayingCardButtonProps {
   setSelectedCardId: (id: string | null) => void;
   handlePlayCard: (id: string, declareMeld: boolean) => void;
   isLongPressRef: React.RefObject<Record<string, boolean>>;
-  isValid?: boolean;
+  isFromSkat?: boolean;
 }
 
 // Memoized Card Component for zero-overhead hand updates
@@ -886,7 +1130,7 @@ const PlayingCardButton = React.memo(function PlayingCardButton({
   setSelectedCardId,
   handlePlayCard,
   isLongPressRef,
-  isValid = true,
+  isFromSkat = false,
 }: PlayingCardButtonProps) {
   const suitInfo = getCardSuitDetails(card.suit);
 
@@ -897,31 +1141,14 @@ const PlayingCardButton = React.memo(function PlayingCardButton({
     }
     if (roomStatus === "DISTRIBUTING" && skatWinner === username) {
       setSelectedCardId(card.id);
-    } else if (roomStatus === "PLAYING" && isMyTurn && isValid) {
+    } else if (roomStatus === "PLAYING" && isMyTurn) {
       handlePlayCard(card.id, e.shiftKey || isShiftPressed);
     }
   };
 
   const isDisabled =
-    (roomStatus === "PLAYING" && (!isMyTurn || !isValid)) ||
+    (roomStatus === "PLAYING" && !isMyTurn) ||
     (roomStatus !== "PLAYING" && roomStatus !== "DISTRIBUTING");
-
-  let cardStyle = "";
-  if (roomStatus === "PLAYING") {
-    if (isMyTurn) {
-      if (isValid) {
-        cardStyle = "border-emerald-400 ring-2 ring-emerald-500/30 shadow-[0_0_12px_rgba(52,211,153,0.3)] scale-[1.02] z-10 hover:scale-[1.08] hover:-translate-y-2";
-      } else {
-        cardStyle = "opacity-35 border-slate-800 scale-95 pointer-events-none";
-      }
-    } else {
-      cardStyle = "opacity-75 border-slate-700/60";
-    }
-  } else if (roomStatus === "DISTRIBUTING") {
-    cardStyle = isSelected ? "active-player scale-[1.02] -translate-y-2" : "border-teal-600/60 hover:border-emerald-400";
-  } else {
-    cardStyle = "opacity-85 border-teal-600/40";
-  }
 
   return (
     <button
@@ -934,8 +1161,17 @@ const PlayingCardButton = React.memo(function PlayingCardButton({
       onContextMenu={(e) => e.preventDefault()}
       onClick={handleInteraction}
       disabled={isDisabled}
-      className={`playing-card relative transition-all duration-300 ${cardStyle}`}
+      className={`playing-card relative ${
+        isSelected ? "active-player" : ""
+      } ${isMyTurn && roomStatus === "PLAYING" ? "border-emerald-400" : "opacity-85"} ${
+        isFromSkat ? "ring-2 ring-amber-500 shadow-[0_0_12px_rgba(245,158,11,0.6)] border-amber-500/80 animate-pulse" : ""
+      }`}
     >
+      {isFromSkat && (
+        <span className="absolute -top-1.5 -right-1.5 text-[7px] font-bold font-mono text-amber-400 bg-gray-950 px-1 py-0.5 rounded border border-amber-500/40 tracking-wider shadow-sm z-10 scale-90">
+          MUSIK
+        </span>
+      )}
       <div className="flex flex-col h-full justify-between">
         <div className="flex justify-between items-start w-full">
           <span className={`text-[14px] font-bold font-mono leading-none text-left self-start ${suitInfo?.color}`}>
